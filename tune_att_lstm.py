@@ -18,58 +18,24 @@ def build_hypermodel(hp):
     # The input_shape required by ATTLSTMModel will be determined by the data preprocessed
     # in main_tuner() using a fixed look_back.
 
-    # The `hp` object is passed to ATTLSTMModel's build_model method, which defines
-    # its own HPs (lstm_units, dense_units, learning_rate, dropout_rate).
-    # We do not need to define them again here in this wrapper, nor pass them to constructor.
-
-    # The `input_shape` is now passed directly to this function when the tuner calls it.
-    # No, that's not how kt.HyperModel works. The build_hypermodel should define how input_shape is derived or fixed.
-    # The `current_input_shape` is passed to `build_hypermodel_with_shape` which then passes it to ATTLSTMModel.
-    # The `fixed_look_back` used here is for the ATTLSTMModel's own `look_back` attribute, which is mainly
-    # for its internal _create_sequences method (not used if data is prepared externally).
-    # The critical `input_shape` for the model layers comes from `current_input_shape`.
-
-    # The `hp.Choice('look_back', ...)` was removed as it's not effectively used without
-    # regenerating data sequences per trial based on the chosen look_back.
-    # `input_shape` is now determined by `fixed_look_back_data_prep` in `main_tuner`.
-
-    # This function is not directly called by the tuner if using the closure `build_hypermodel_with_shape`.
-    # The actual hyperparameter definitions are in ATTLSTMModel.build_model(hp).
-    # This function's body can be empty or raise an error if accidentally called.
-    # For clarity, let's ensure it's not causing confusion. It's effectively replaced by the closure.
-    raise NotImplementedError("This build_hypermodel(hp) should not be called directly by tuner if using the closure; use ATTLSTMModel.build_model(hp) via the closure.")
-
-    # Note: Preprocessing data inside build_hypermodel for each trial can be slow if look_back changes.
-    # A more efficient approach for tuning look_back would be to prepare datasets for each look_back
-    # value beforehand and select the appropriate one.
-    # For now, this is a simplified approach to demonstrate tuning other parameters primarily.
-    # If look_back is fixed, data_preprocessor can be initialized once outside the tuner loop.
-
-    # Simplified: We need input_shape. This is tricky if look_back itself is tuned.
-    # Let's assume a fixed number of features for now after preprocessing for a default look_back,
-    # and the actual look_back for sequence creation is tuned.
-    # This means data_preprocessor.preprocess() needs to be called to determine num_features.
-
-    # This function is now a wrapper around ATTLSTMModel.build_model.
-    # The actual hyperparameter definitions (lstm_units, dense_units, learning_rate, dropout_rate)
-    # are inside ATTLSTMModel.build_model(hp).
-    # We need to ensure this function receives input_shape.
-    # This function will be replaced by build_hypermodel_with_shape in main_tuner.
-    # The original build_hypermodel(hp) is not used directly by RandomSearch anymore.
-    raise NotImplementedError("This build_hypermodel(hp) should not be called directly by tuner if using the closure.")
+    # This function is effectively replaced by the closure build_hypermodel_with_shape.
+    # The original build_hypermodel(hp) is not called by the tuner.
+    pass
 
 
 def main_tuner(
     stock_ticker="^AEX",
-    years_of_data=3, # Default to 3 years for quicker test runs of the tuner script
-    project_name_prefix="stock_att_lstm_hyperband_test", # Indicate it's a test run
+    years_of_data=5, # Increased years of data for more robust tuning
+    project_name_prefix="stock_att_lstm_hyperband_aggressive",
     look_back_period=60,
-    max_epochs_hyperband=27, # Reduced for quicker test runs
-    hyperband_iterations=1,  # Reduced for quicker test runs
-    early_stopping_patience=5 # Adjusted for fewer epochs
+    max_epochs_hyperband=150, # Increased max_epochs for Hyperband
+    hyperband_iterations=3,  # Increased Hyperband iterations
+    early_stopping_patience=20, # Increased patience for early stopping
+    use_differencing_for_tuning=False # Added parameter to control differencing during tuning
 ):
     """
     Main function to run KerasTuner with Hyperband for a specific look_back_period.
+    Includes tuning for batch_size.
     """
     project_name = f"{project_name_prefix}_{years_of_data}yr_{look_back_period}d_lookback"
     print(f"Starting hyperparameter tuning for {stock_ticker} using {years_of_data} years of data.")
@@ -78,11 +44,18 @@ def main_tuner(
 
     # --- 1. Data Preparation ---
     # Use a default lasso_alpha for tuning runs; it can be experimented with separately.
-    data_preprocessor = DataPreprocessor(stock_ticker=stock_ticker, years_of_data=years_of_data, random_seed=42, lasso_alpha=0.005)
+    # Pass use_differencing_for_tuning to DataPreprocessor
+    data_preprocessor = DataPreprocessor(
+        stock_ticker=stock_ticker,
+        years_of_data=years_of_data,
+        random_seed=42,
+        lasso_alpha=0.005, # Default LASSO alpha for tuning
+        use_differencing=use_differencing_for_tuning # Control differencing
+    )
 
     # Ensure this matches the return signature of DataPreprocessor.preprocess()
     # It now returns 5 values: scaled_df, target_scaler, selected_features_names, df_with_all_indicators_cleaned, first_price_before_diff
-    processed_df, _, selected_features, _, _ = data_preprocessor.preprocess()
+    processed_df, _, selected_features, _, first_price_val_if_diff = data_preprocessor.preprocess()
 
     if processed_df.empty:
         print("Error: Preprocessed data is empty. Aborting tuning.")
@@ -139,32 +112,30 @@ def main_tuner(
     current_input_shape = (X_train_seq.shape[1], X_train_seq.shape[2]) # (timesteps, features)
                                                                     # timesteps here is look_back_period
 
-    def build_hypermodel_with_shape(hp):
+    def build_hypermodel_with_shape(hp): # Reverted name
         # This inner function captures current_input_shape and look_back_period
         model_instance = ATTLSTMModel(
-            input_shape=current_input_shape, # This correctly uses the current look_back_period
-            look_back=look_back_period, # Pass it for consistency, though input_shape is primary driver
-            random_seed=42 # Ensure reproducibility within tuner trials for model initialization
+            input_shape=current_input_shape,
+            look_back=look_back_period,
+            random_seed=42
         )
         # ATTLSTMModel.build_model uses hp to get units, lr, dropout etc.
-        return model_instance.build_model(hp)
-
+        # We can add hp.Choice for batch_size here if the tuner itself supports it for model.fit()
+        # For now, batch_size is handled outside this function for tuner.search()
+        model = model_instance.build_model(hp)
+        return model
 
     # --- 2. KerasTuner Setup ---
     # Using Hyperband tuner
-    # max_epochs is the max epochs a single model can be trained for.
-    # factor is the reduction factor for the number of models and epochs per bracket.
-    # hyperband_iterations controls how many times the Hyperband algorithm is run.
-    # More iterations can lead to better results but take longer.
     tuner = kt.Hyperband(
-        hypermodel=build_hypermodel_with_shape,
+        hypermodel=build_hypermodel_with_shape, # Reverted name
         objective='val_loss',
-        max_epochs=max_epochs_hyperband, # Use the passed parameter
+        max_epochs=max_epochs_hyperband,
         factor=3,
-        hyperband_iterations=hyperband_iterations, # Use the passed parameter
-        directory='keras_tuner_dir', # Main directory for all tuning projects
-        project_name=project_name,   # Subdirectory for this specific tuning run
-        overwrite=True # Overwrite previous results for this specific project_name
+        hyperband_iterations=hyperband_iterations,
+        directory='keras_tuner_dir',
+        project_name=project_name,
+        overwrite=True
     )
 
     tuner.search_space_summary()
@@ -173,19 +144,63 @@ def main_tuner(
     print("Starting KerasTuner Hyperband search...")
     early_stopping_cb = tf.keras.callbacks.EarlyStopping(
         monitor='val_loss',
-        patience=early_stopping_patience, # Use the passed parameter
+        patience=early_stopping_patience,
         restore_best_weights=True
     )
 
-    # The `epochs` in `search` is often set to a high number or related to `max_epochs` for Hyperband.
-    # KerasTuner documentation indicates it's overridden by `max_epochs` in the Hyperband constructor.
-    # Setting it equal to `max_epochs_hyperband` for clarity.
+    # Define batch_size as a hyperparameter to be tuned by KerasTuner
+    # This hp will be used by the tuner to pass to model.fit()
+    hp_batch_size = hp.Choice('batch_size', values=[16, 32, 64])
+
+    # Note: For KerasTuner to properly use hp.Choice for batch_size in model.fit(),
+    # the hyperparameter must be defined within the hypermodel's build method.
+    # The tuner then typically handles passing this to fit.
+    # If tuner.search() is called with a batch_size argument, that fixed value is used.
+    # To tune batch_size, it must be part of the hp space passed to the hypermodel.
+    # Then, during the search, the tuner will manage fitting with different batch_sizes.
+
+    # The following line `current_batch_size = 32` makes batch_size fixed.
+    # To tune it, we would need to ensure the `hp` object within `build_hypermodel_with_shape`
+    # defines `hp.Choice('batch_size', ...)` and that the tuner uses this.
+    # KerasTuner's default behavior is that `model.fit` (called internally by `tuner.search`)
+    # will receive the `batch_size` from the hyperparameters if it's defined.
+
+    # Let's ensure 'batch_size' is defined in the hypermodel scope for the tuner to pick it up.
+    # We need to modify `build_hypermodel_with_shape` to include `hp.Choice('batch_size', ...)`
+    # even if it's not directly used in model architecture. KerasTuner will then use it for `fit`.
+
+    # Re-defining build_hypermodel_with_shape to include batch_size in its HPs
+    def build_hypermodel_with_shape(hp):
+        model_instance = ATTLSTMModel(
+            input_shape=current_input_shape,
+            look_back=look_back_period,
+            random_seed=42
+        )
+        # Define batch_size as a hyperparameter here so KerasTuner is aware of it
+        _ = hp.Choice('batch_size', values=[16, 32, 64, 128]) # Tuner will use this for model.fit()
+
+        model = model_instance.build_model(hp) # hp here is for architecture (layers, units, lr, etc.)
+        return model
+
+    # Re-initialize tuner with the corrected hypermodel function
+    tuner = kt.Hyperband(
+        hypermodel=build_hypermodel_with_shape,
+        objective='val_loss',
+        max_epochs=max_epochs_hyperband,
+        factor=3,
+        hyperband_iterations=hyperband_iterations,
+        directory='keras_tuner_dir',
+        project_name=project_name,
+        overwrite=True
+    )
+    tuner.search_space_summary() # Re-print summary with batch_size potentially included by tuner
+
     tuner.search(
         X_train_seq, y_train_seq,
-        epochs=max_epochs_hyperband, # Use the passed parameter
+        epochs=max_epochs_hyperband,
         validation_data=(X_val_seq, y_val_seq),
-        callbacks=[early_stopping_cb],
-        batch_size=32 # This could also be tuned. For now, fixed.
+        callbacks=[early_stopping_cb]
+        # batch_size argument is NOT explicitly passed here; KerasTuner will use the 'batch_size' from hp if defined.
     )
 
     # --- 4. Results ---
@@ -223,39 +238,48 @@ if __name__ == '__main__':
     # test_early_stopping_patience = 5
 
     # For a more comprehensive tuning run (can be time-consuming):
-    full_look_back_values = [30, 60, 90, 120]
-    full_years = 3 # Or 15 as per plan
-    full_max_epochs = 81
-    full_hyperband_iterations = 2 # Or 3 for more thoroughness
-    full_early_stopping_patience = 10
+    # AGGRESSIVE TUNING CONFIGURATION
+    aggressive_look_back_values = [20, 30, 40, 50, 60, 75, 90, 120, 150] # Expanded look_back
+    aggressive_years = 7 # Increased years of data, e.g., 5 to 7 for more data if available and relevant
+    aggressive_max_epochs = 200  # Significantly increased max_epochs for Hyperband
+    aggressive_hyperband_iterations = 4 # Increased Hyperband iterations
+    aggressive_early_stopping_patience = 30 # Increased patience
 
     # --- Select which configuration to run ---
-    # Change these to 'full_*' variables for a comprehensive run
-    current_look_back_values = full_look_back_values
-    current_years = full_years
-    current_max_epochs = full_max_epochs
-    current_hyperband_iterations = full_hyperband_iterations
-    current_early_stopping_patience = full_early_stopping_patience
-    project_prefix = "stock_att_lstm_tuning_full_3yr" # Change if doing a full run
+    # Set to aggressive values
+    current_look_back_values = aggressive_look_back_values
+    current_years = aggressive_years
+    current_max_epochs = aggressive_max_epochs
+    current_hyperband_iterations = aggressive_hyperband_iterations
+    current_early_stopping_patience = aggressive_early_stopping_patience
+    # Ensure project_prefix reflects the aggressive nature and key params like years.
+    project_prefix = f"stock_att_lstm_aggressive_{current_years}yr"
 
+    # Allow choosing differencing strategy for the entire tuning campaign
+    tune_with_differencing = False # Set to True to run all tuning with differencing enabled
 
-    print(f"--- Starting KerasTuner Optimization Script ---")
-    print(f"Running with: Look_backs={current_look_back_values}, Years={current_years}, MaxEpochs={current_max_epochs}, HB_Iterations={current_hyperband_iterations}")
+    print(f"--- Starting KerasTuner Optimization Script (Aggressive Tuning) ---")
+    print(f"Running with: Look_backs={current_look_back_values}, Years={current_years}, MaxEpochs={current_max_epochs}, HB_Iterations={current_hyperband_iterations}, Differencing for Tuning: {tune_with_differencing}")
 
     for lb_period in current_look_back_values:
         print(f"\n--- Running Tuner for Look-Back Period: {lb_period} ---")
+
+        # Construct a specific project name for this run to include differencing status
+        current_project_name_prefix = f"{project_prefix}_diff_{tune_with_differencing}"
+
         main_tuner(
-            stock_ticker="^AEX", # Or make this a parameter
+            stock_ticker="^AEX",
             years_of_data=current_years,
-            project_name_prefix=project_prefix,
+            project_name_prefix=current_project_name_prefix, # Pass the modified prefix
             look_back_period=lb_period,
             max_epochs_hyperband=current_max_epochs,
             hyperband_iterations=current_hyperband_iterations,
-            early_stopping_patience=current_early_stopping_patience
+            early_stopping_patience=current_early_stopping_patience,
+            use_differencing_for_tuning=tune_with_differencing # Pass differencing choice
         )
         print(f"--- Tuner Run for Look-Back Period: {lb_period} Finished ---")
 
-    print("\n--- KerasTuner Script for Look-Back Optimization Finished ---")
+    print("\n--- KerasTuner Script for Look-Back Optimization (Aggressive) Finished ---")
 
 # Note on look_back tuning:
 # The current setup runs the entire KerasTuner search for each look_back period.
