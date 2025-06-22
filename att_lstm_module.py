@@ -58,30 +58,38 @@ class ATTLSTMModel:
 
     def build_model(self, hp=None): # Accept hp object
         if hp: # Use hyperparameters from tuner if provided
-            num_lstm_layers = hp.Int('num_lstm_layers', min_value=1, max_value=2, step=1)
+            num_lstm_layers = hp.Int('num_lstm_layers', min_value=1, max_value=3, step=1) # Max 3 LSTM layers
             lstm_units_1 = hp.Int('lstm_units_1', min_value=32, max_value=512, step=32)
-            # Only define lstm_units_2 if num_lstm_layers is 2
+
             if num_lstm_layers > 1:
                 lstm_units_2 = hp.Int('lstm_units_2', min_value=32, max_value=256, step=32)
+            if num_lstm_layers > 2:
+                lstm_units_3 = hp.Int('lstm_units_3', min_value=32, max_value=128, step=32)
 
-            num_dense_layers = hp.Int('num_dense_layers', min_value=1, max_value=2, step=1)
+            num_dense_layers = hp.Int('num_dense_layers', min_value=1, max_value=3, step=1) # Max 3 Dense layers
             dense_units_1 = hp.Int('dense_units_1', min_value=32, max_value=256, step=32)
             if num_dense_layers > 1:
                 dense_units_2 = hp.Int('dense_units_2', min_value=16, max_value=128, step=16)
+            if num_dense_layers > 2:
+                dense_units_3 = hp.Int('dense_units_3', min_value=16, max_value=64, step=16)
 
             learning_rate = hp.Float('learning_rate', min_value=1e-5, max_value=1e-2, sampling='log')
-            dropout_rate_lstm = hp.Float('dropout_rate_lstm', min_value=0.1, max_value=0.5, step=0.1)
-            dropout_rate_dense = hp.Float('dropout_rate_dense', min_value=0.1, max_value=0.5, step=0.1)
-            activation_dense = hp.Choice('activation_dense', values=['relu', 'tanh', 'elu'])
+            dropout_rate_lstm = hp.Float('dropout_rate_lstm', min_value=0.0, max_value=0.5, step=0.05) # finer steps, start from 0
+            dropout_rate_dense = hp.Float('dropout_rate_dense', min_value=0.0, max_value=0.5, step=0.05) # finer steps, start from 0
+            activation_dense = hp.Choice('activation_dense', values=['relu', 'tanh', 'elu', 'selu']) # Added 'selu'
 
         else: # Use instance attributes (from self.model_params or their defaults)
             num_lstm_layers = self.num_lstm_layers
             lstm_units_1 = self.lstm_units_1
-            lstm_units_2 = self.lstm_units_2 # Will be used if num_lstm_layers > 1
+            lstm_units_2 = self.model_params.get('lstm_units_2', 64) # Ensure defaults are available
+            lstm_units_3 = self.model_params.get('lstm_units_3', 64)
+
 
             num_dense_layers = self.num_dense_layers
             dense_units_1 = self.dense_units_1
-            dense_units_2 = self.dense_units_2 # Will be used if num_dense_layers > 1
+            dense_units_2 = self.model_params.get('dense_units_2', 32) # Ensure defaults are available
+            dense_units_3 = self.model_params.get('dense_units_3', 32)
+
 
             learning_rate = self.learning_rate
             dropout_rate_lstm = self.dropout_rate_lstm
@@ -92,21 +100,39 @@ class ATTLSTMModel:
         x = inputs
 
         # LSTM layers
+        current_lstm_dropout = dropout_rate_lstm if hp else self.dropout_rate_lstm
+
         # First LSTM layer
+        # Return sequences if more LSTM layers or if it's the only LSTM layer (for Attention)
+        rs_lstm1 = (num_lstm_layers > 1) or (num_lstm_layers == 1) # Always true for attention
         x = LSTM(units=lstm_units_1,
-                 return_sequences=True, # Crucial: True if followed by another LSTM or Attention that sees all sequences
-                 dropout=dropout_rate_lstm if hp else 0.0,
-                 recurrent_dropout=dropout_rate_lstm if hp else 0.0
+                 return_sequences=rs_lstm1,
+                 dropout=current_lstm_dropout,
+                 recurrent_dropout=current_lstm_dropout
                 )(x)
 
         # Second LSTM layer (optional)
         if num_lstm_layers > 1:
-            # The second (now last) LSTM layer also needs return_sequences=True for the attention mechanism
-            x = LSTM(units=lstm_units_2, # lstm_units_2 is defined if num_lstm_layers > 1
-                     return_sequences=True,
-                     dropout=dropout_rate_lstm if hp else 0.0,
-                     recurrent_dropout=dropout_rate_lstm if hp else 0.0
+            rs_lstm2 = (num_lstm_layers > 2) or (num_lstm_layers == 2) # True if 3rd LSTM or if it's the last (for Attention)
+            # Use lstm_units_2 defined in hp block or from self.model_params
+            units_l2 = lstm_units_2 if hp or 'lstm_units_2' in self.model_params else self.lstm_units_2
+            x = LSTM(units=units_l2,
+                     return_sequences=rs_lstm2,
+                     dropout=current_lstm_dropout,
+                     recurrent_dropout=current_lstm_dropout
                     )(x)
+
+        # Third LSTM layer (optional)
+        if num_lstm_layers > 2:
+            # The last LSTM layer also needs return_sequences=True for the attention mechanism
+            # Use lstm_units_3 defined in hp block or from self.model_params
+            units_l3 = lstm_units_3 if hp or 'lstm_units_3' in self.model_params else self.model_params.get('lstm_units_3', 64) # fallback default
+            x = LSTM(units=units_l3,
+                     return_sequences=True, # Last LSTM for attention
+                     dropout=current_lstm_dropout,
+                     recurrent_dropout=current_lstm_dropout
+                    )(x)
+
 
         # --- Attention Mechanism (applied to the output of the last LSTM layer) ---
         # Query: last hidden state of the final LSTM layer
@@ -128,14 +154,26 @@ class ATTLSTMModel:
         x = merged_output
 
         # Dense layers for prediction
+        current_dense_dropout = dropout_rate_dense if hp else self.dropout_rate_dense
+        current_activation = activation_dense if hp else self.activation_dense
+
         # First Dense layer
-        x = Dense(units=dense_units_1, activation=activation_dense if hp else 'relu')(x)
-        x = Dropout(dropout_rate_dense if hp else 0.2)(x)
+        x = Dense(units=dense_units_1, activation=current_activation)(x)
+        x = Dropout(current_dense_dropout)(x)
 
         # Second Dense layer (optional)
         if num_dense_layers > 1:
-            x = Dense(units=dense_units_2, activation=activation_dense if hp else 'relu')(x) # dense_units_2 is defined if num_dense_layers > 1
-            x = Dropout(dropout_rate_dense if hp else 0.2)(x)
+            # Use dense_units_2 defined in hp block or from self.model_params
+            units_d2 = dense_units_2 if hp or 'dense_units_2' in self.model_params else self.dense_units_2
+            x = Dense(units=units_d2, activation=current_activation)(x)
+            x = Dropout(current_dense_dropout)(x)
+
+        # Third Dense layer (optional)
+        if num_dense_layers > 2:
+            # Use dense_units_3 defined in hp block or from self.model_params
+            units_d3 = dense_units_3 if hp or 'dense_units_3' in self.model_params else self.model_params.get('dense_units_3', 32) # fallback default
+            x = Dense(units=units_d3, activation=current_activation)(x)
+            x = Dropout(current_dense_dropout)(x)
 
         outputs = Dense(1)(x) # Output a single value for stock price prediction
 
